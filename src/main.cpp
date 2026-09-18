@@ -255,6 +255,18 @@ void loop() {
     yMotor.tick(nowUs);
     conveyor.tick(nowUs);
 
+    // --- 輸送台端點硬性保護 ------------------------------------------
+    // 不論處在哪個狀態，只要壓到端點限位就立刻停 —— 這是全域的最後一道防線。
+    // 之前只在特定狀態裡檢查，結果輸送台在 Image 狀態下與相機回程並行下推時
+    // 沒人看底部開關，一路把 A0 撞掉。方向判斷用 direction()：只有正在
+    // 往那一端走才停，否則剛離開端點時會被自己的限位卡住動不了。
+    if (conveyor.isMoving()) {
+        const bool goingDown = (conveyor.direction() == CONV_DOWN);
+        if (goingDown ? convBottom.isTriggered() : convTop.isTriggered()) {
+            conveyor.stop();
+        }
+    }
+
     // --- 自鎖開關關掉 -> 立刻停止一切 --------------------------------
     // 原版要等當前動作跑完才會發現開關關了；現在是即時的。
     if (!startSwitch.isDown()) {
@@ -388,11 +400,9 @@ void loop() {
     case State::BackToPhoto:
         // 等相機真的回到拍照起點才進 ToBottom —— 輸送台此時已經在往下走了。
         // 兩者都還沒完成時就停在這個狀態，但馬達照樣在動。
-        if (xMotor.isMoving() || yMotor.isMoving()) {
-            // 相機還在回程，但輸送台可能已經先到底了，先擋住避免漏掉
-            if (convBottom.isTriggered()) conveyor.stop();
-            break;
-        }
+        // 輸送台若先到底，loop 開頭的全域保護已經把它停住了；
+        // ToBottom 會看 convBottom 仍被壓著而正常計數，不會漏掉。
+        if (xMotor.isMoving() || yMotor.isMoving()) break;
         Serial.println(F("STANDBY_AT_PHOTO"));
         state = State::ToBottom;
         break;
