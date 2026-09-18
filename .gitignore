@@ -1,0 +1,14 @@
+# PlatformIO 建置產物與快取
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# 編輯器
+.vscode/
+!.vscode/extensions.json
+.idea/
+
+# 作業系統
+Thumbs.db
+Desktop.ini
+.DS_Store
