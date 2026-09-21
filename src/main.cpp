@@ -15,7 +15,8 @@
 #include "hal/Dm542Driver.h"
 #include "hal/A4988Driver.h"
 #include "hal/SerialCapture.h"
-#include "hal/FakeCapture.h"     // ★ 模擬用，Python 接上後可移除
+#include "hal/FakeCapture.h"
+#include "TestConfig.h"           // ★ 所有測試開關集中在這裡
 #include "Button.h"
 #include "Stepper.h"
 #include "Homing.h"
@@ -54,8 +55,8 @@ static const bool X_LIMIT_FAR_ACTIVE_LOW    = false;
 static const bool Y_LIMIT_FAR_ACTIVE_LOW    = false;
 static const bool CONV_BOTTOM_ACTIVE_LOW    = false;  // NC 接法（C→GND）
 static const bool CONV_TOP_ACTIVE_LOW       = false;  // NC 接法，與底部同型同接法
-static const bool SAMPLE_PRESENT_ACTIVE_LOW = true;
-static const bool IR_ACTIVE_LOW             = true;
+static const bool SAMPLE_PRESENT_ACTIVE_LOW = false;  // 兩線 NC（2026-09-21 實測）
+static const bool IR_ACTIVE_LOW             = false;  // 兩線 NC（2026-09-21 實測）
 static const bool START_SW_ACTIVE_LOW       = true;
 
 // 馬達方向（實機第一次測試務必手扶著、隨時準備斷電）
@@ -69,7 +70,10 @@ static const bool CAM_Y_TOWARD_HOME = true;
 // ═══════════════════════════════════════════
 // 運動參數
 // ═══════════════════════════════════════════
-static const uint32_t CONV_PPR = 800;    // DM542 DIP 1/4 微步（2026-09-18 實測確認）
+// DM542 DIP 1/4 微步。試過 1/8（1600）比較安靜，但 375 rpm 需要半週期 50us，
+// 而 loop() 一輪（9 個 Button + 3 個 Stepper + camera.poll）就吃掉數十 us ——
+// UNO 16MHz 跟不上，實際轉速反而掉下來。1/4 是速度與噪音的平衡點。
+static const uint32_t CONV_PPR = 800;
 static const uint32_t CAM_PPR  = 400;    // A4988 1/2 微步（MS1 插、MS2 空、MS3 插）
                                          // ★ 動跳線帽就要改這裡，STEPS_PER_COL/ROW 也得重量
 
@@ -80,8 +84,10 @@ static const uint32_t CAM_HALF_US  = 800;  // 相機巡航，400 PPR → 93 rpm
 
 // 歸位：快速接近用來省時間，慢速二次接近決定重現性。
 // 相機是皮帶傳動，撞到開關後若還在高速推會跳齒，所以慢速這段要夠慢。
-static const uint32_t CONV_HOME_FAST_US = 400;   // 800 PPR → 93 rpm
-static const uint32_t CONV_HOME_SLOW_US = 1200;  // 800 PPR → 31 rpm
+// 快速接近就用巡航速度 —— 最壞情況要從 A0 爬回 D11（實測 64000 步），
+// 400us 要 51 秒，150us 只要 19 秒。真正決定定位精度的是後面的慢速段。
+static const uint32_t CONV_HOME_FAST_US = 150;   // 800 PPR → 250 rpm
+static const uint32_t CONV_HOME_SLOW_US = 1200;  // 800 PPR → 31 rpm，維持慢速確保重現性
 static const uint32_t CAM_HOME_FAST_US  = 800;   // 400 PPR → 93 rpm
 static const uint32_t CAM_HOME_SLOW_US  = 2500;  // 400 PPR → 30 rpm
 static const uint32_t HOME_BACKOFF = 200;
@@ -99,30 +105,25 @@ static const uint32_t CAM_RAMP_STEPS     = 200;
 static const uint32_t PHOTO_X_STEPS = 2137;   // X 兩端餘裕僅 2137 步，累積誤差要靠定期歸位清掉
 static const uint32_t PHOTO_Y_STEPS = 2934;
 
-// ═══════════════════════════════════════════
-// ★ 暫行模擬設定 —— A1／A2 感測器還沒到貨
-// ═══════════════════════════════════════════
-// 兩顆感測器到貨接好後，把這兩個改回 false，其餘程式碼不用動。
-static const bool SIMULATE_SAMPLE_ALWAYS = true;   // 當作頂部永遠有樣本
-static const bool SIMULATE_FEED_BY_STEPS = true;   // 不等 A2，改走固定步數
+// 測試開關的值都在 TestConfig.h，這裡只是取個好讀的名字。
+static const bool SIMULATE_SAMPLE_ALWAYS = TEST_SIMULATE_SAMPLE;
+static const bool SIMULATE_FEED_BY_STEPS = TEST_SIMULATE_FEED;
+static const uint32_t FEED_STEPS = TEST_FEED_STEPS;
 
-// 實測輸送台全行程 = 64000 步（2026-09-17），取中點當暫定拍照位置。
-// 樣本實際停的位置若偏了，改這個數字即可。
-static const uint32_t FEED_STEPS = 32000;
-
-static const uint32_t STEPS_PER_COL = 1360;
-static const uint32_t STEPS_PER_ROW = 1040;
-static const uint16_t COLS = 10;
-static const uint16_t ROWS = 7;            // 樣本盤實際列數
+static const uint32_t STEPS_PER_COL = CFG_STEPS_PER_COL;
+static const uint32_t STEPS_PER_ROW = CFG_STEPS_PER_ROW;
+static const uint16_t COLS = CFG_COLS;
+static const uint16_t ROWS = CFG_ROWS;
 
 // 逾時保護：超過這個步數還沒等到該等的訊號就判定卡料/故障
-// 實測輸送台全行程 = 80 圈 = 64000 步（2026-09-17），這些上限留約 15% 餘裕。
+// 實測輸送台全行程 = 80 圈（2026-09-17）。800 PPR 下 = 64000 步，上限留約 15%
+// 餘裕。★ 改微步就要連這裡一起改，否則會在走到底之前就逾時。
 static const uint32_t MAX_STEPS_TO_IR     = 75000UL;
 static const uint32_t MAX_STEPS_TO_BOTTOM = 75000UL;
 static const uint32_t MAX_STEPS_TO_TOP    = 75000UL;
 static const uint32_t MAX_HOMING_STEPS    = 75000UL;
 
-static const long HOMING_EVERY_N_ROUNDS = 2;   // ★ 測試期先設 2，確認誤差累積狀況後再放寬
+static const long HOMING_EVERY_N_ROUNDS = TEST_HOMING_EVERY_N;
 
 // ═══════════════════════════════════════════
 // 硬體實體
@@ -151,10 +152,11 @@ static Stepper xMotor(xDrv, CAM_PPR, CAM_HALF_US);
 static Stepper yMotor(yDrv, CAM_PPR, CAM_HALF_US);
 static Stepper conveyor(convDrv, CONV_PPR, CONV_HALF_US);
 
-// ★ 模擬模式：Python 還沒接上，用 FakeCapture 自己回應，好把整個流程跑完。
-//   Python 接好後改回 SerialCapture 那一行即可（Scanner 不用動）。
-// static SerialCapture camera(10000);
-static FakeCapture camera(300);   // 每格假裝拍 300ms
+#if TEST_FAKE_CAPTURE
+static FakeCapture   camera(TEST_CAPTURE_DELAY_MS);   // 不等 PC，自己回應
+#else
+static SerialCapture camera(10000);                   // 等 PC 回 OK
+#endif
 
 static Homing xHoming(xMotor, xLimit, CAM_X_TOWARD_HOME,
                       CAM_HOME_FAST_US, CAM_HOME_SLOW_US,
@@ -191,6 +193,11 @@ enum class State : uint8_t {
 static State state = State::Idle;
 // 相機回程時輸送台是否已先行下推 —— 避免每輪 loop 重複排入移動。
 static bool  convDescending = false;
+// 全域保護把輸送台停在端點時記一筆 —— ToBottom/ToTop 不能只看開關當下的
+// 狀態：停下後滑塊可能微退、或開關正好在臨界點，等流程走到那個狀態時
+// isTriggered() 已經變回 false，會被誤判成「沒碰到限位」而報錯。
+static bool  convStoppedAtBottom = false;
+static bool  convStoppedAtTop    = false;
 static long  roundCount = 0;
 
 static void fail(const __FlashStringHelper* reason) {
@@ -260,10 +267,12 @@ void loop() {
     // 之前只在特定狀態裡檢查，結果輸送台在 Image 狀態下與相機回程並行下推時
     // 沒人看底部開關，一路把 A0 撞掉。方向判斷用 direction()：只有正在
     // 往那一端走才停，否則剛離開端點時會被自己的限位卡住動不了。
-    if (conveyor.isMoving()) {
+    // 歸位期間不攔：Homing 的第一步就是從被壓住的開關上退開，攔了反而卡住。
+    if (conveyor.isMoving() && !convHoming.isBusy()) {
         const bool goingDown = (conveyor.direction() == CONV_DOWN);
         if (goingDown ? convBottom.isTriggered() : convTop.isTriggered()) {
             conveyor.stop();
+            if (goingDown) convStoppedAtBottom = true; else convStoppedAtTop = true;
         }
     }
 
@@ -335,9 +344,11 @@ void loop() {
         Serial.println(F("FEEDING"));
         if (SIMULATE_FEED_BY_STEPS) {
             // 沒有 A2，改走固定步數。底部限位仍會在 Feed 裡擋住，不會撞到底。
+            convStoppedAtBottom = convStoppedAtTop = false;
             conveyor.setHalfPeriodUs(CONV_HALF_US);
             conveyor.moveSteps(FEED_STEPS, CONV_DOWN);
         } else {
+            convStoppedAtBottom = convStoppedAtTop = false;
             conveyor.setHalfPeriodUs(CONV_HALF_US);
             conveyor.moveUntilSignal(MAX_STEPS_TO_IR, CONV_DOWN);
         }
@@ -387,6 +398,7 @@ void loop() {
         // loop() 每輪都會推進，兩段動作重疊可省下整個回程的時間。
         if (scanner.isReturning() && !convDescending) {
             convDescending = true;
+            convStoppedAtBottom = convStoppedAtTop = false;
             Serial.println(F("TO_BOTTOM (與相機回程同時進行)"));
             conveyor.setHalfPeriodUs(CONV_HALF_US);
             conveyor.moveUntilSignal(MAX_STEPS_TO_BOTTOM, CONV_DOWN);
@@ -421,13 +433,16 @@ void loop() {
 
     case State::ToBottom:
         // 這階段只看底部開關，完全不看紅外線 -> 樣本還壓在感測器上也不會卡死
-        if (convBottom.isTriggered()) {
+        // convStoppedAtBottom：相機回程期間就到底、被全域保護停住的情形。
+        if (convBottom.isTriggered() || convStoppedAtBottom) {
+            convStoppedAtBottom = false;
             conveyor.stop();
             // 推到底代表這個樣本完成了 —— 計數在這裡，不在掃描完成時。
             ++roundCount;
             Serial.print(F("AT_BOTTOM · SAMPLE_DONE:"));
             Serial.println(roundCount);
             Serial.println(F("RETURN_TOP"));
+            convStoppedAtBottom = convStoppedAtTop = false;
             conveyor.setHalfPeriodUs(CONV_HALF_US);
             conveyor.moveUntilSignal(MAX_STEPS_TO_TOP, CONV_UP);
             state = State::ToTop;
@@ -437,7 +452,8 @@ void loop() {
         break;
 
     case State::ToTop:
-        if (convTop.isTriggered()) {
+        if (convTop.isTriggered() || convStoppedAtTop) {
+            convStoppedAtTop = false;
             conveyor.stop();
             Serial.print(F("ROUND_DONE:"));
             Serial.println(roundCount);
@@ -450,7 +466,10 @@ void loop() {
 
             if (scheduled || lostSteps) {
                 Serial.println(scheduled ? F("SCHEDULED_HOMING") : F("WARN:LOST_STEPS"));
+                // 兩軸都要 start() —— 只起 X 的話 yHoming 的 result 還停在
+                // 建構時的 Done，ReHome 會以為 Y 已經歸位完而直接跳過。
                 xHoming.start();
+                yHoming.start();
                 state = State::ReHome;
             } else {
                 state = State::CheckSample;
@@ -462,6 +481,11 @@ void loop() {
 
     case State::NoSample:
     case State::Fault:
+        // 兩者都停在這裡，要把 A3 關掉再開才會重來。
+        //
+        // NoSample 刻意不做「放上樣本就自動續跑」—— 補料時人的手在機台裡，
+        // 樣本一壓到 A1 馬達就動起來會夾到人。必須由人退開後主動按 A3，
+        // 才是安全的啟動時機。
         // 停在這裡，把自鎖開關關掉再開才會重來
         break;
     }
