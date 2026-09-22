@@ -196,6 +196,10 @@ static bool  convDescending = false;
 // 全域保護把輸送台停在端點時記一筆 —— ToBottom/ToTop 不能只看開關當下的
 // 狀態：停下後滑塊可能微退、或開關正好在臨界點，等流程走到那個狀態時
 // isTriggered() 已經變回 false，會被誤判成「沒碰到限位」而報錯。
+// A1 有樣本、推下去卻沒碰到 A2 就到底了 —— 樣本沒進到拍照位置（A1 誤觸、
+// 樣本掉落、或卡在半路）。記一筆統計，歸位後照常接下一個，不停機。
+static long  missedPhotoCount = 0;
+static bool  missedThisRound  = false;   // 這趟是漏拍返回 -> 回頂部後強制歸位一次
 static bool  convStoppedAtBottom = false;
 static bool  convStoppedAtTop    = false;
 static long  roundCount = 0;
@@ -374,6 +378,22 @@ void loop() {
             }
             break;
         }
+        // 推到底卻還沒碰到 A2 —— 這個樣本沒能停在拍照位置。
+        // 不拍照、不計入完成數，記一筆之後照常回頂部歸位、接下一個。
+        if (convBottom.isTriggered() || convStoppedAtBottom) {
+            convStoppedAtBottom = false;
+            conveyor.stop();
+            ++missedPhotoCount;
+            missedThisRound = true;
+            Serial.print(F("WARN:NO_SAMPLE_AT_PHOTO  累計 "));
+            Serial.println(missedPhotoCount);
+            Serial.println(F("RETURN_TOP"));
+            convStoppedAtTop = false;
+            conveyor.setHalfPeriodUs(CONV_HALF_US);
+            conveyor.moveUntilSignal(MAX_STEPS_TO_TOP, CONV_UP);
+            state = State::ToTop;
+            break;
+        }
         // 正常模式：只看紅外線，不看底部開關
         if (irSensor.isTriggered()) {
             conveyor.stop();
@@ -460,12 +480,18 @@ void loop() {
 
             // 滿 N 個樣本就重新歸位一次，把累積的誤差清掉。
             // 另外檢查丟步：相機此刻應該停在拍照位置，不該壓著原點開關。
-            bool scheduled = (roundCount % HOMING_EVERY_N_ROUNDS == 0);
+            // 漏拍那趟 roundCount 沒有變，不能用它判斷排程（同一個數字會
+            // 每趟都成立或都不成立）—— 改成直接強制歸位一次。
+            bool missed    = missedThisRound;
+            missedThisRound = false;
+            bool scheduled = !missed && (roundCount % HOMING_EVERY_N_ROUNDS == 0);
             bool lostSteps = (PHOTO_X_STEPS > 0 && xLimit.isTriggered()) ||
                              (PHOTO_Y_STEPS > 0 && yLimit.isTriggered());
 
-            if (scheduled || lostSteps) {
-                Serial.println(scheduled ? F("SCHEDULED_HOMING") : F("WARN:LOST_STEPS"));
+            if (missed || scheduled || lostSteps) {
+                Serial.println(missed    ? F("HOMING_AFTER_MISS")
+                             : scheduled ? F("SCHEDULED_HOMING")
+                                         : F("WARN:LOST_STEPS"));
                 // 兩軸都要 start() —— 只起 X 的話 yHoming 的 result 還停在
                 // 建構時的 Done，ReHome 會以為 Y 已經歸位完而直接跳過。
                 xHoming.start();
